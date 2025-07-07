@@ -198,7 +198,7 @@ export default function App() {
                     } catch (seedError) {
                         console.error('Error seeding data:', seedError);
                     }
-                    return; // El listener se activará de nuevo con los nuevos datos
+                    return;
                 }
 
                 const meetingsData = snapshot.docs.map(doc => {
@@ -211,9 +211,6 @@ export default function App() {
                 });
                 
                 setMeetings(meetingsData);
-                if (!selectedItem && meetingsData.length > 0) {
-                    setSelectedItem(meetingsData[0]);
-                }
                 setLoadingMessage("");
                 setError(null);
             },
@@ -228,7 +225,14 @@ export default function App() {
             console.log('Cleaning up meetings listener');
             unsubscribe();
         };
-    }, [userId, db, selectedItem]);
+    }, [userId, db]);
+
+    // --- Select first meeting when meetings load ---
+    useEffect(() => {
+        if (!selectedItem && meetings.length > 0 && !isEditing) {
+            setSelectedItem(meetings[0]);
+        }
+    }, [meetings, selectedItem, isEditing]);
     
     // --- Data Loading: Draft Meeting ---
     useEffect(() => {
@@ -242,12 +246,13 @@ export default function App() {
                 if (docSnap.exists()) {
                     console.log('Draft found');
                     const data = docSnap.data();
-                    setDraftMeeting({
+                    const draftData = {
                         id: docSnap.id,
                         ...data,
                         date: data.date instanceof Timestamp ? data.date.toDate() : new Date(data.date),
                         isDraft: true
-                    });
+                    };
+                    setDraftMeeting(draftData);
                 } else {
                     console.log('No draft found');
                     setDraftMeeting(null);
@@ -255,7 +260,6 @@ export default function App() {
             },
             (error) => {
                 console.error("Error fetching draft:", error);
-                // No mostrar error para drafts, es normal que no existan
             }
         );
 
@@ -264,6 +268,13 @@ export default function App() {
             unsubscribe();
         };
     }, [userId, db]);
+
+    // --- Sync draft with selectedItem when editing ---
+    useEffect(() => {
+        if (isEditing && selectedItem?.isDraft && draftMeeting) {
+            setSelectedItem(draftMeeting);
+        }
+    }, [draftMeeting, isEditing, selectedItem?.isDraft]);
 
     // --- Mock Gemini API Call ---
     const callGeminiAPI = async (prompt) => {
