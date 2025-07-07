@@ -1,4 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { initializeApp, getApps } from 'firebase/app';
+import { getFirestore, collection, doc, onSnapshot, addDoc, setDoc, deleteDoc, query, orderBy, Timestamp } from 'firebase/firestore';
+import { getAuth, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
 import { Save, Trash2, Edit, X, Bot, FileText, ListChecks, CalendarPlus, Download, Send } from 'lucide-react';
 
 // --- Helper Components & Functions ---
@@ -8,8 +11,10 @@ const formatDate = (date) => {
     let dateObj;
     if (date instanceof Date) {
         dateObj = date;
-    } else if (typeof date === 'string') {
-        dateObj = new Date(date);
+    } else if (date && typeof date.toDate === 'function') {
+        dateObj = date.toDate();
+    } else if (date && date.seconds) {
+        dateObj = new Date(date.seconds * 1000);
     } else {
         return 'Invalid date';
     }
@@ -47,7 +52,6 @@ const FormattedSectionContent = ({ text }) => {
 // --- Data & Templates ---
 const initialMeetingsData = [
     {
-        id: '1',
         date: new Date('2025-06-03T12:00:00Z'),
         title: "Business Partners/Community Kitchen Huddle",
         sections: {
@@ -95,72 +99,6 @@ const emptyMeeting = {
     }
 };
 
-// --- Storage Utilities ---
-const storageUtils = {
-    getMeetings: () => {
-        try {
-            const stored = localStorage.getItem('bp-meetings');
-            if (!stored) {
-                // Initialize with demo data
-                storageUtils.setMeetings(initialMeetingsData);
-                return initialMeetingsData;
-            }
-            const parsed = JSON.parse(stored);
-            return parsed.map(meeting => ({
-                ...meeting,
-                date: new Date(meeting.date)
-            }));
-        } catch (error) {
-            console.error('Error loading meetings:', error);
-            return initialMeetingsData;
-        }
-    },
-
-    setMeetings: (meetings) => {
-        try {
-            const serialized = meetings.map(meeting => ({
-                ...meeting,
-                date: meeting.date.toISOString()
-            }));
-            localStorage.setItem('bp-meetings', JSON.stringify(serialized));
-        } catch (error) {
-            console.error('Error saving meetings:', error);
-        }
-    },
-
-    getDraft: () => {
-        try {
-            const stored = localStorage.getItem('bp-draft');
-            if (!stored) return null;
-            const parsed = JSON.parse(stored);
-            return {
-                ...parsed,
-                date: new Date(parsed.date),
-                isDraft: true
-            };
-        } catch (error) {
-            console.error('Error loading draft:', error);
-            return null;
-        }
-    },
-
-    setDraft: (draft) => {
-        try {
-            if (!draft) {
-                localStorage.removeItem('bp-draft');
-                return;
-            }
-            const serialized = {
-                ...draft,
-                date: draft.date.toISOString()
-            };
-            localStorage.setItem('bp-draft', JSON.stringify(serialized));
-        } catch (error) {
-            console.error('Error saving draft:', error);
-        }
-    }
-};
-
 // --- Main App Component ---
 export default function App() {
     // --- State Management ---
@@ -168,27 +106,165 @@ export default function App() {
     const [draftMeeting, setDraftMeeting] = useState(null);
     const [selectedItem, setSelectedItem] = useState(null);
     const [isEditing, setIsEditing] = useState(false);
+    const [db, setDb] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [loadingMessage, setLoadingMessage] = useState("Connecting to Firebase...");
+    const [showScheduleModal, setShowScheduleModal] = useState(false);
+    const [error, setError] = useState(null);
     const [isLoadingAI, setIsLoadingAI] = useState(false);
     const [modalContent, setModalContent] = useState(null);
     const [modalTitle, setModalTitle] = useState("");
-    const [showScheduleModal, setShowScheduleModal] = useState(false);
-    const [isInitialized, setIsInitialized] = useState(false);
 
-    // --- Initialize Data ---
+    // --- Firebase Configuration ---
+    const firebaseConfig = useMemo(() => ({
+        apiKey: "AIzaSyDuzey52yERpfFMd_YfSu6iKFrSvuuWxnE",
+        authDomain: "bp-weekly-huddle.firebaseapp.com",
+        projectId: "bp-weekly-huddle",
+        storageBucket: "bp-weekly-huddle.firebasestorage.app",
+        messagingSenderId: "435049860029",
+        appId: "1:435049860029:web:80247f6684c65bbe82e0d4"
+    }), []);
+
+    // --- Firebase Initialization and Auth ---
     useEffect(() => {
-        const loadedMeetings = storageUtils.getMeetings();
-        const loadedDraft = storageUtils.getDraft();
+        const initFirebase = async () => {
+            try {
+                setLoadingMessage("Initializing Firebase...");
+                
+                // Inicializar Firebase
+                const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
+                const firestore = getFirestore(app);
+                const auth = getAuth(app);
+                
+                setDb(firestore);
+                setLoadingMessage("Authenticating...");
+                
+                // Configurar autenticación
+                onAuthStateChanged(auth, async (user) => {
+                    if (user) {
+                        console.log('User authenticated:', user.uid);
+                        setUserId(user.uid);
+                        setLoadingMessage("");
+                        setError(null);
+                    } else {
+                        try {
+                            console.log('Signing in anonymously...');
+                            await signInAnonymously(auth);
+                        } catch (authError) {
+                            console.error("Error signing in:", authError);
+                            setError(`Authentication failed: ${authError.message}`);
+                            setLoadingMessage("");
+                        }
+                    }
+                });
+                
+            } catch (initError) {
+                console.error("Error initializing Firebase:", initError);
+                setError(`Firebase initialization failed: ${initError.message}`);
+                setLoadingMessage("");
+            }
+        };
+
+        initFirebase();
+    }, [firebaseConfig]);
+
+    // --- Data Loading: Published Meetings ---
+    useEffect(() => {
+        if (!userId || !db) return;
         
-        setMeetings(loadedMeetings);
-        setDraftMeeting(loadedDraft);
+        console.log('Setting up meetings listener...');
+        setLoadingMessage("Loading meetings...");
         
-        if (!selectedItem && loadedMeetings.length > 0) {
-            setSelectedItem(loadedMeetings[0]);
-        }
+        const meetingsCollection = collection(db, 'meetings');
+        const q = query(meetingsCollection, orderBy('date', 'desc'));
         
-        setIsInitialized(true);
-    }, [selectedItem]);
+        const unsubscribe = onSnapshot(q, 
+            async (snapshot) => {
+                console.log('Meetings snapshot received:', snapshot.size, 'documents');
+                
+                // Si no hay documentos, sembrar datos iniciales
+                if (snapshot.empty) {
+                    console.log('No meetings found, seeding initial data...');
+                    try {
+                        for (const meetingData of initialMeetingsData) {
+                            const dataToSave = {
+                                ...meetingData,
+                                date: Timestamp.fromDate(meetingData.date),
+                                createdAt: Timestamp.now()
+                            };
+                            await addDoc(meetingsCollection, dataToSave);
+                        }
+                        console.log('Initial data seeded successfully');
+                    } catch (seedError) {
+                        console.error('Error seeding data:', seedError);
+                    }
+                    return; // El listener se activará de nuevo con los nuevos datos
+                }
+
+                const meetingsData = snapshot.docs.map(doc => {
+                    const data = doc.data();
+                    return {
+                        id: doc.id,
+                        ...data,
+                        date: data.date instanceof Timestamp ? data.date.toDate() : new Date(data.date)
+                    };
+                });
+                
+                setMeetings(meetingsData);
+                if (!selectedItem && meetingsData.length > 0) {
+                    setSelectedItem(meetingsData[0]);
+                }
+                setLoadingMessage("");
+                setError(null);
+            },
+            (error) => {
+                console.error("Error fetching meetings:", error);
+                setError(`Error loading meetings: ${error.message}`);
+                setLoadingMessage("");
+            }
+        );
+
+        return () => {
+            console.log('Cleaning up meetings listener');
+            unsubscribe();
+        };
+    }, [userId, db, selectedItem]);
     
+    // --- Data Loading: Draft Meeting ---
+    useEffect(() => {
+        if (!userId || !db) return;
+        
+        console.log('Setting up draft listener...');
+        const draftDocRef = doc(db, 'drafts', 'current-draft');
+        
+        const unsubscribe = onSnapshot(draftDocRef, 
+            (docSnap) => {
+                if (docSnap.exists()) {
+                    console.log('Draft found');
+                    const data = docSnap.data();
+                    setDraftMeeting({
+                        id: docSnap.id,
+                        ...data,
+                        date: data.date instanceof Timestamp ? data.date.toDate() : new Date(data.date),
+                        isDraft: true
+                    });
+                } else {
+                    console.log('No draft found');
+                    setDraftMeeting(null);
+                }
+            },
+            (error) => {
+                console.error("Error fetching draft:", error);
+                // No mostrar error para drafts, es normal que no existan
+            }
+        );
+
+        return () => {
+            console.log('Cleaning up draft listener');
+            unsubscribe();
+        };
+    }, [userId, db]);
+
     // --- Mock Gemini API Call ---
     const callGeminiAPI = async (prompt) => {
         setIsLoadingAI(true);
@@ -258,7 +334,7 @@ export default function App() {
             
         } catch (error) {
             console.error("Error in mock API call:", error);
-            return `Error: Could not generate content. This is a demo version - in production, this would connect to the actual Gemini API.`;
+            return `Error: Could not generate content. This is a demo version showing AI potential - in production, this would connect to the actual Gemini API.`;
         } finally {
             setIsLoadingAI(false);
         }
@@ -325,12 +401,13 @@ export default function App() {
         if (!selectedItem?.isDraft) return;
         setIsEditing(true);
     };
-    
+
     const handleCreateOrEditDraft = () => {
-        const draftToEdit = draftMeeting || {
-            ...emptyMeeting,
-            date: new Date(),
-            isDraft: true
+        const draftToEdit = draftMeeting || { 
+            ...emptyMeeting, 
+            date: new Date(), 
+            isDraft: true,
+            id: 'current-draft'
         };
         setSelectedItem(draftToEdit);
         setIsEditing(true);
@@ -345,65 +422,65 @@ export default function App() {
         }
     };
 
-    const handleSave = () => {
-        if (!selectedItem?.isDraft) return;
+    const handleSave = async () => {
+        if (!db || !selectedItem?.isDraft) return;
         
         try {
             console.log('Saving draft...');
-            const { isDraft, ...dataToSave } = selectedItem;
-            dataToSave.updatedAt = new Date().toISOString();
+            const draftDocRef = doc(db, 'drafts', 'current-draft');
+            const { id, isDraft, ...dataToSave } = selectedItem;
             
-            storageUtils.setDraft(dataToSave);
-            setDraftMeeting({ ...selectedItem });
-            setIsEditing(false);
+            // Convertir fecha a Timestamp de Firestore
+            dataToSave.date = Timestamp.fromDate(new Date(dataToSave.date));
+            dataToSave.updatedAt = Timestamp.now();
+            
+            await setDoc(draftDocRef, dataToSave);
             console.log('Draft saved successfully');
+            setIsEditing(false);
+            setError(null);
         } catch (error) {
             console.error('Error saving draft:', error);
-            alert('Error saving draft. Please try again.');
+            setError(`Error saving draft: ${error.message}`);
         }
     };
     
-    const handlePublish = () => {
-        if (!draftMeeting) return;
+    const handlePublish = async () => {
+        if (!db || !draftMeeting) return;
         
         try {
             console.log('Publishing meeting...');
-            const { isDraft, ...dataToPublish } = draftMeeting;
+            const { id, isDraft, ...dataToPublish } = draftMeeting;
             
-            const newMeeting = {
-                ...dataToPublish,
-                id: Date.now().toString(),
-                publishedAt: new Date().toISOString()
-            };
+            // Convertir fecha a Timestamp de Firestore
+            dataToPublish.date = Timestamp.fromDate(new Date(dataToPublish.date));
+            dataToPublish.publishedAt = Timestamp.now();
             
-            const updatedMeetings = [newMeeting, ...meetings];
-            setMeetings(updatedMeetings);
-            storageUtils.setMeetings(updatedMeetings);
-            storageUtils.setDraft(null);
+            // Agregar a meetings collection
+            await addDoc(collection(db, 'meetings'), dataToPublish);
             
-            setDraftMeeting(null);
-            setSelectedItem(newMeeting);
+            // Eliminar draft
+            await deleteDoc(doc(db, 'drafts', 'current-draft'));
+            
             console.log('Meeting published successfully');
+            setError(null);
         } catch (error) {
             console.error('Error publishing meeting:', error);
-            alert('Error publishing meeting. Please try again.');
+            setError(`Error publishing meeting: ${error.message}`);
         }
     };
 
-    const handleDelete = () => {
-        if (!selectedItem || selectedItem.isDraft) return;
+    const handleDelete = async () => {
+        if (!db || !selectedItem || selectedItem.isDraft) return;
         
         if (window.confirm("Are you sure you want to delete this published meeting? This action cannot be undone.")) {
             try {
                 console.log('Deleting meeting:', selectedItem.id);
-                const updatedMeetings = meetings.filter(m => m.id !== selectedItem.id);
-                setMeetings(updatedMeetings);
-                storageUtils.setMeetings(updatedMeetings);
-                setSelectedItem(updatedMeetings.length > 0 ? updatedMeetings[0] : null);
+                await deleteDoc(doc(db, 'meetings', selectedItem.id));
                 console.log('Meeting deleted successfully');
+                setError(null);
             } catch (error) {
                 console.error('Error deleting meeting:', error);
-                alert('Error deleting meeting. Please try again.');
+                setError(`Error deleting meeting: ${error.message}`);
             }
         }
     };
@@ -426,13 +503,33 @@ export default function App() {
         }));
     };
     
-    // --- Loading State ---
-    if (!isInitialized) {
+    // --- Loading/Error States ---
+    if (error) {
+        return (
+            <div className="flex items-center justify-center h-screen bg-gray-100">
+                <div className="p-6 text-center bg-white rounded-lg shadow-lg max-w-md">
+                    <div className="text-red-500 mb-4">
+                        <X size={48} className="mx-auto" />
+                    </div>
+                    <h2 className="text-xl font-bold text-gray-900 mb-2">Connection Error</h2>
+                    <p className="text-gray-700 mb-4">{error}</p>
+                    <button 
+                        onClick={() => window.location.reload()} 
+                        className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                    >
+                        Retry
+                    </button>
+                </div>
+            </div>
+        );
+    }
+
+    if (!userId || loadingMessage) {
         return (
             <div className="flex items-center justify-center h-screen bg-gray-100">
                 <div className="p-4 text-center">
                     <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
-                    <p className="text-gray-700">Loading your meeting workspace...</p>
+                    <p className="text-gray-700">{loadingMessage}</p>
                 </div>
             </div>
         );
@@ -445,7 +542,7 @@ export default function App() {
                     <div className="text-center">
                         <div className="animate-spin rounded-full h-16 w-16 border-t-2 border-b-2 border-purple-500 mx-auto mb-4"></div>
                         <p className="text-gray-700 font-medium">Generating AI content...</p>
-                        <p className="text-sm text-gray-500 mt-2">This is a demo - real implementation would use Gemini API</p>
+                        <p className="text-sm text-gray-500 mt-2">This is a demo showing AI potential</p>
                     </div>
                 </div>
             )}
@@ -487,9 +584,15 @@ export default function App() {
                     </button>
                 </div>
 
-                <div className="p-4">
+                <div className="p-4 flex justify-between items-center">
                     <h1 className="text-xl font-bold text-gray-900">Published History</h1>
-                    <p className="text-xs text-gray-500 mt-1">Demo Mode - Data stored locally</p>
+                    <button
+                        onClick={() => setShowScheduleModal(true)}
+                        className="flex items-center gap-1 px-3 py-1 text-sm font-semibold text-blue-600 bg-blue-50 rounded-lg hover:bg-blue-100"
+                    >
+                        <CalendarPlus size={16} />
+                        Schedule
+                    </button>
                 </div>
 
                 <div className="flex-grow overflow-y-auto">
@@ -559,13 +662,8 @@ export default function App() {
                             <Bot size={48} className="mx-auto text-gray-400 mb-4"/>
                             <h2 className="text-2xl font-bold">Welcome to Your Meeting Space</h2>
                             <p className="mt-2 max-w-md mx-auto">
-                                Demo Mode Active - Select a meeting from the history or start a new draft.
+                                Connected to Firebase! Select a meeting from the history or start a new draft.
                             </p>
-                            <div className="mt-4 p-3 bg-blue-50 rounded-lg max-w-md mx-auto">
-                                <p className="text-sm text-blue-800">
-                                    <strong>For Production:</strong> Replace local storage with Firebase integration
-                                </p>
-                            </div>
                         </div>
                     </div>
                 )}
